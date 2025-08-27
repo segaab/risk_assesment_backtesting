@@ -262,7 +262,7 @@ def summarize_performance(d: pd.DataFrame, eq: pd.DataFrame) -> pd.DataFrame:
         cum = np.exp(r.cumsum().iloc[-1]) - 1.0
         vol = r.std() * np.sqrt(ann_factor)
         sharpe = (r.mean() * ann_factor) / (vol + 1e-12)
-        curve = eq[col.replace("_pnl", "")]
+        curve = eq[col]  # <-- fixed KeyError here
         mdd = (curve.cummax() / curve - 1.0).max()
         rows.append({"strategy": col.replace("_pnl",""), "cum_return": cum, "ann_vol": vol, "sharpe": sharpe, "max_drawdown": mdd})
     return pd.DataFrame(rows)
