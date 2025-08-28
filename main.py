@@ -35,7 +35,10 @@ preloaded_data = {
 # Helper functions
 # ---------------------------
 @st.cache_data(show_spinner=False, ttl=60*30)
-def cg_coin_market_chart(coin_id: str, vs_currency: str, days: int):
+def cg_coin_market_chart(coin_id: str, vs_currency: str, days: int) -> pd.DataFrame:
+    """
+    Fetch historical market chart data for a coin from CoinGecko.
+    """
     url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
     params = {"vs_currency": vs_currency, "days": days, "interval": "daily"}
     r = requests.get(url, params=params, headers=HEADERS, timeout=30)
@@ -50,6 +53,7 @@ def cg_coin_market_chart(coin_id: str, vs_currency: str, days: int):
     prices = to_df(data.get("prices", []), "price")
     volumes = to_df(data.get("total_volumes", []), "volume")
     mktcap = to_df(data.get("market_caps", []), "market_cap")
+
     df = prices.merge(volumes, on="date", how="outer").merge(mktcap, on="date", how="outer")
     df.sort_values("date", inplace=True)
     return df
