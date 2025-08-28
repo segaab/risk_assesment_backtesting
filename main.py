@@ -26,21 +26,14 @@ Data: CoinGecko API (Pro header included). Research tool only; not financial adv
 # ---------------------------
 # Preloaded JSON data for low-cap coins
 # ---------------------------
-
-# Example: preloaded JSON for akash-network
 preloaded_data = {
-    "akash-network": {
-        "prices": [],  # Replace with actual JSON list [[ts_ms, price], ...]
-        "market_caps": [],  # Replace with actual JSON list [[ts_ms, market_cap], ...]
-        "total_volumes": []  # Replace with actual JSON list [[ts_ms, volume], ...]
-    },
-    # Add other coins here if needed
+    "akash-network": {"prices": [], "market_caps": [], "total_volumes": []},
+    # Add other coins here
 }
 
 # ---------------------------
 # Helper functions
 # ---------------------------
-
 @st.cache_data(show_spinner=False, ttl=60*30)
 def cg_coin_market_chart(coin_id: str, vs_currency: str, days: int):
     url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
@@ -74,21 +67,12 @@ def derive_liquidity_and_imbalance(df: pd.DataFrame, vol_window: int = 14, flow_
 # ---------------------------
 # Sidebar: data selection
 # ---------------------------
-
-st.sidebar.header("Data")
+st.sidebar.header("Data Source")
 source = st.sidebar.selectbox("Source", ["CoinGecko (auto)", "Upload CSV"])
 
 available_coins = [
-    "akash-network",
-    "celestia",
-    "injective-protocol", 
-    "beam-2",
-    "sei-network",
-    "sui",
-    "near",
-    "render-token",
-    "optimism",
-    "arbitrum"
+    "akash-network", "celestia", "injective-protocol", "beam-2", "sei-network",
+    "sui", "near", "render-token", "optimism", "arbitrum"
 ]
 
 uploaded_df = None
@@ -105,22 +89,18 @@ with st.sidebar.expander("Low-cap universe selection", expanded=True):
 # ---------------------------
 # Load data
 # ---------------------------
-
 df = None
 if source == "CoinGecko (auto)":
     try:
         if coin_id in preloaded_data and preloaded_data[coin_id]["prices"]:
             data = preloaded_data[coin_id]
-            dfs = {}
-            for key in ["prices", "market_caps", "total_volumes"]:
-                df_tmp = pd.DataFrame(data[key], columns=["ts_ms", key[:-1]])
-                df_tmp["date"] = pd.to_datetime(df_tmp["ts_ms"], unit="ms").dt.tz_localize(None)
-                dfs[key] = df_tmp[["date", key[:-1]]]
+            dfs = {k: pd.DataFrame(data[k], columns=["ts_ms", k[:-1]]).assign(
+                date=lambda x: pd.to_datetime(x["ts_ms"], unit="ms").dt.tz_localize(None)
+            ) for k in ["prices","market_caps","total_volumes"]}
             raw = dfs["prices"].merge(dfs["total_volumes"], on="date").merge(dfs["market_caps"], on="date")
             raw.sort_values("date", inplace=True)
         else:
             raw = cg_coin_market_chart(coin_id, vs_currency, int(days_back))
-
         df = derive_liquidity_and_imbalance(raw)
         st.success(f"Loaded {len(df)} daily points for {coin_id}.")
         st.dataframe(df.tail(10), use_container_width=True)
@@ -138,7 +118,6 @@ if df is None or len(df) < 60:
 # ---------------------------
 # Simulation parameters
 # ---------------------------
-
 st.sidebar.header("Simulation Parameters")
 H = st.sidebar.number_input("Simulation horizon (days)", value=10, min_value=2, max_value=180)
 N_MC = st.sidebar.number_input("Monte Carlo paths", value=500, min_value=50, max_value=5000, step=50)
@@ -165,7 +144,6 @@ with st.sidebar.expander("Strategy 2 parameters", expanded=True):
 # ---------------------------
 # Monte Carlo simulation & strategy logic
 # ---------------------------
-
 def run_hybrid_simulation(P0, L0, I0, H, params):
     alpha_L, beta_L, rho_I, mu_I, sigma0, kappa, gamma = params
     P, L, I = P0, max(1e-6, L0), np.clip(I0, -1, 1)
@@ -205,7 +183,6 @@ st.line_chart(df_bt.set_index("date")[["pred_crash_prob"]], use_container_width=
 # ---------------------------
 # Strategy 2 positions & PnL
 # ---------------------------
-
 df_long = df_bt.copy()
 df_long["mom_k"] = df_long["price"]/df_long["price"].shift(int(k_mom))-1.0
 liq_median = df_long["liquidity"].median()
@@ -242,7 +219,6 @@ st.line_chart(equity_curves, use_container_width=True)
 # ---------------------------
 # Decision log
 # ---------------------------
-
 def build_decision_log(d: pd.DataFrame) -> pd.DataFrame:
     log = d[["date","price","liquidity","imbalance","ret","pred_crash_prob",
              "position_early","position_mid","position_late"]].copy()
@@ -260,7 +236,6 @@ with st.expander("Decision log (exportable)"):
 # ---------------------------
 # Performance summary
 # ---------------------------
-
 def summarize_performance(d: pd.DataFrame, eq: pd.DataFrame) -> pd.DataFrame:
     ann_factor = 365
     desired = ["position_early_pnl","position_mid_pnl","position_late_pnl","bh_pnl"]
