@@ -120,6 +120,7 @@ def run_hybrid_simulation(P0, L0, I0, H, params):
         path.append([P, L, I, r])
     return np.array(path)
 
+
 # ---------------------------
 # Chunk 2: Strategy 2, Backtest & Decay Entries
 # ---------------------------
