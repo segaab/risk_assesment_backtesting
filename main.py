@@ -50,24 +50,31 @@ def cg_coin_history_series(coin_id: str, vs_currency: str, days: int) -> pd.Data
 
         data = r.json()
         mkt = data.get("market_data", {})
+        if not mkt:
+            continue
 
         row = {
-            "date": d,
+            "date": pd.to_datetime(d),
             "price": mkt.get("current_price", {}).get(vs_currency),
             "volume": mkt.get("total_volume", {}).get(vs_currency),
             "market_cap": mkt.get("market_cap", {}).get(vs_currency),
         }
         rows.append(row)
 
+    if not rows:
+        return pd.DataFrame(columns=["date","price","volume","market_cap"])
+
     df = pd.DataFrame(rows).dropna().sort_values("date").reset_index(drop=True)
     return df
 
 def derive_liquidity_and_imbalance(df: pd.DataFrame, vol_window: int = 14, flow_window: int = 7) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["date","price","liquidity","imbalance","ret","volume","market_cap"])
     out = df.copy()
     out["ret"] = np.log(out["price"]).diff()
     out["volatility"] = out["ret"].rolling(vol_window).std()
     out["norm_volume"] = out["volume"].rolling(vol_window).mean()
-    out["liquidity"] = (out["norm_volume"] / (out["volatility"] + 1e-8)).fillna(method="bfill").fillna(0)
+    out["liquidity"] = (out["norm_volume"] / (out["volatility"] + 1e-8)).fillna(0)
     out["imbalance"] = (out["ret"].rolling(flow_window).mean() - out["ret"].rolling(flow_window).median()).fillna(0)
     return out[["date","price","liquidity","imbalance","ret","volume","market_cap"]]
 
@@ -116,6 +123,10 @@ with st.sidebar:
 # ---------------------------
 try:
     raw = cg_coin_history_series(coin_id, vs_currency, int(days))
+    if raw.empty:
+        st.error("No historical data returned from CoinGecko. Try fewer days or another coin.")
+        st.stop()
+
     df = derive_liquidity_and_imbalance(raw)
 
     if df.shape[0] < max(60, k_mom + late_window + 5):
@@ -175,6 +186,10 @@ try:
     res["pnl_mid"]   = pnl_with_costs(res["pos_mid"], res["ret"], fee_bps)
     res["pnl_late"]  = pnl_with_costs(res["pos_late"], res["ret"], fee_bps)
     res["pnl_bh"]    = res["ret"].fillna(0.0)
+
+    if "date" not in res.columns:
+        st.error("No valid 'date' column found in results. Cannot plot equity curves.")
+        st.stop()
 
     eq = res.set_index("date")[["pnl_early","pnl_mid","pnl_late","pnl_bh"]].cumsum().apply(np.exp)
 
