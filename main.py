@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+from datetime import datetime, timedelta
 from typing import Dict
-import matplotlib.pyplot as plt
 
 # ---------------------------
 # CoinGecko Pro API Key + Base URL
@@ -15,52 +15,51 @@ COINGECKO_BASE = "https://pro-api.coingecko.com/api/v3"
 # ---------------------------
 # Streamlit setup
 # ---------------------------
-st.set_page_config(page_title="Low-Cap Crypto Crash Backtest (Strategy 2)", layout="wide")
-st.title("Low-Cap Crypto Sector Crash Simulator & Backtest — Strategy 2 Only")
+st.set_page_config(page_title="Low-Cap Crypto Crash Backtest (Strategy 2, History API)", layout="wide")
+st.title("Low-Cap Crypto Sector Crash Simulator & Backtest — Strategy 2 (History API)")
 
 st.markdown("""
-This dashboard simulates risk proxies (liquidity & imbalance) and backtests **Strategy 2**:
-- **Momentum + Liquidity gating** with **early / mid / late** entry variants.
-- **Early-decay filter**: suppresses exposure when momentum decays sharply.
+This dashboard simulates risk proxies and backtests **Strategy 2**  
+using **CoinGecko Pro's `/coins/{id}/history` endpoint**.  
 
-Data source: **CoinGecko Pro API**  
-Authentication: via `x-cg-pro-api-key` header.  
-Research tool only — **not financial advice**.
+⚠️ Notice: `/history` only returns **one day snapshot at 00:00 UTC**.  
+We loop over days to build the dataset. This can be slower.
 """)
 
 # ---------------------------
-# Data helpers (CoinGecko Pro call)
+# Data helpers (CoinGecko Pro History API)
 # ---------------------------
 @st.cache_data(show_spinner=False, ttl=60*30)
-def cg_coin_market_chart(coin_id: str, vs_currency: str, days: int) -> pd.DataFrame:
+def cg_coin_history_series(coin_id: str, vs_currency: str, days: int) -> pd.DataFrame:
     """
-    Fetch historical market chart data for a coin from CoinGecko Pro.
-
-    Args:
-        coin_id (str): CoinGecko coin ID (e.g., 'akash-network').
-        vs_currency (str): Quote currency ('usd', 'eur', 'btc').
-        days (int): Number of days of history to fetch.
-
-    Returns:
-        pd.DataFrame: columns: date, price, volume, market_cap
+    Fetch historical data series by calling /coins/{id}/history for each date.
     """
-    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
-    params = {"vs_currency": vs_currency, "days": days, "interval": "daily"}
-    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=days)
+    rows = []
 
-    def to_df(lst, col):
-        df = pd.DataFrame(lst, columns=["ts_ms", col])
-        df["date"] = pd.to_datetime(df["ts_ms"], unit="ms").dt.tz_localize(None)
-        return df[["date", col]]
+    for i in range(days + 1):
+        d = start_date + timedelta(days=i)
+        d_str = d.strftime("%d-%m-%Y")  # CoinGecko expects DD-MM-YYYY
+        url = f"{COINGECKO_BASE}/coins/{coin_id}/history"
+        params = {"date": d_str, "localization": "false"}
+        r = requests.get(url, params=params, headers=HEADERS, timeout=30)
 
-    prices = to_df(data.get("prices", []), "price")
-    volumes = to_df(data.get("total_volumes", []), "volume")
-    mktcap = to_df(data.get("market_caps", []), "market_cap")
+        if r.status_code != 200:
+            continue
 
-    df = prices.merge(volumes, on="date", how="outer").merge(mktcap, on="date", how="outer")
-    df.sort_values("date", inplace=True)
+        data = r.json()
+        mkt = data.get("market_data", {})
+
+        row = {
+            "date": d,
+            "price": mkt.get("current_price", {}).get(vs_currency),
+            "volume": mkt.get("total_volume", {}).get(vs_currency),
+            "market_cap": mkt.get("market_cap", {}).get(vs_currency),
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows).dropna().sort_values("date").reset_index(drop=True)
     return df
 
 def derive_liquidity_and_imbalance(df: pd.DataFrame, vol_window: int = 14, flow_window: int = 7) -> pd.DataFrame:
@@ -93,13 +92,13 @@ with st.sidebar:
     coin_name = st.selectbox("Coin", list(COINS.keys()))
     coin_id = COINS[coin_name]
     vs_currency = st.selectbox("Quote currency", ["usd", "eur", "btc"], index=0)
-    days = st.number_input("History (days)", min_value=90, max_value=1825, value=365, step=30)
+    days = st.number_input("History (days)", min_value=30, max_value=720, value=180, step=30)
 
     st.header("Strategy 2 parameters")
     k_mom = st.number_input("Momentum lookback (days)", value=20, min_value=5, max_value=120, step=5)
-    early_window = st.number_input("Early entry rolling window", value=5, min_value=2, max_value=60, step=1)
-    mid_window = st.number_input("Mid entry rolling window", value=15, min_value=5, max_value=120, step=1)
-    late_window = st.number_input("Late entry rolling window", value=30, min_value=10, max_value=180, step=1)
+    early_window = st.number_input("Early entry window", value=5, min_value=2, max_value=60, step=1)
+    mid_window = st.number_input("Mid entry window", value=15, min_value=5, max_value=120, step=1)
+    late_window = st.number_input("Late entry window", value=30, min_value=10, max_value=180, step=1)
 
     liq_quantile_gate = st.slider("Liquidity gate quantile", 0.0, 1.0, 0.50, 0.05)
     liq_scale = st.checkbox("Scale position by relative liquidity", value=True)
@@ -116,7 +115,7 @@ with st.sidebar:
 # Load & prepare data
 # ---------------------------
 try:
-    raw = cg_coin_market_chart(coin_id, vs_currency, int(days))
+    raw = cg_coin_history_series(coin_id, vs_currency, int(days))
     df = derive_liquidity_and_imbalance(raw)
 
     if df.shape[0] < max(60, k_mom + late_window + 5):
@@ -179,14 +178,8 @@ try:
 
     eq = res.set_index("date")[["pnl_early","pnl_mid","pnl_late","pnl_bh"]].cumsum().apply(np.exp)
 
-    # ---------------------------
-    # Plots & tables
-    # ---------------------------
     st.subheader("Equity Curves")
     st.line_chart(eq, use_container_width=True)
-
-    with st.expander("Recent Decay Flags"):
-        st.dataframe(res.loc[res["decay_flag"] == 1, ["date","price","log_slope","decay_flag"]].tail(15), use_container_width=True)
 
     def summarize(d: pd.DataFrame, equity: pd.DataFrame) -> pd.DataFrame:
         ann = 365
