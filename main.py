@@ -120,127 +120,133 @@ def run_hybrid_simulation(P0, L0, I0, H, params):
         path.append([P, L, I, r])
     return np.array(path)
 
-
 # ---------------------------
-# Chunk 2: Strategy 2, Backtest & Decay Entries
+# Long-side strategy: Strategy 2 only
 # ---------------------------
 
-st.subheader("Strategy 2: Momentum + Liquidity (Early/Mid/Late Entry)")
+st.subheader("Long-side Strategy 2 (Momentum + Crash Prob)")
 
-with st.sidebar.expander("Strategy 2 Parameters", expanded=True):
-k_mom = st.number_input("Momentum lookback (days)", value=20, min_value=5, max_value=120, step=5)
-T2 = st.number_input("Crash prob soft threshold", value=0.25, min_value=0.0, max_value=1.0, step=0.05)
-reduce_factor = st.number_input("Position reduce factor on high crash prob", value=0.5, min_value=0.0, max_value=1.0, step=0.05)
+df_long = df_ed.copy()
+df_long["mom_k"] = df_long["price"] / df_long["price"].shift(int(k_mom)) - 1.0
 
-# Early / Mid / Late decay windows
-early_window = st.sidebar.number_input("Early entry lookback (days)", value=5, min_value=1, max_value=30)
-mid_window = st.sidebar.number_input("Mid entry lookback (days)", value=15, min_value=1, max_value=60)
-late_window = st.sidebar.number_input("Late entry lookback (days)", value=30, min_value=1, max_value=90)
+liq_median = df_long["liquidity"].median()
 
-df_bt = df.copy()
-df_bt["mom_k"] = df_bt["price"] / df_bt["price"].shift(int(k_mom)) - 1.0
-liq_median = df_bt["liquidity"].median()
+def rolling_beta_posterior(probs: pd.Series, window: int = 30, a0: float = 1.0, b0: float = 1.0, cred: float = 0.95):
+    means, lowers, uppers = [], [], []
+    for i in range(len(probs)):
+        lo = max(0, i - window + 1)
+        p_slice = probs.iloc[lo : i + 1].fillna(0).clip(0, 1)
+        succ = p_slice.sum()
+        trials = len(p_slice)
+        a = a0 + succ
+        b = b0 + (trials - succ)
+        mean = a / (a + b)
+        var = (a * b) / (((a + b) ** 2) * (a + b + 1))
+        z = norm.ppf(0.5 + cred / 2.0)
+        se = np.sqrt(var)
+        means.append(mean)
+        lowers.append(mean - z * se)
+        uppers.append(mean + z * se)
+    return pd.DataFrame({"post_mean": means, "post_low": lowers, "post_high": uppers}, index=probs.index)
 
-# Function to build position with decay-based entries
-def build_decay_positions(d: pd.DataFrame):
+post_df = rolling_beta_posterior(df_long["pred_crash_prob"], window=30, cred=0.95)
+
+def build_strategy2_positions(d: pd.DataFrame) -> pd.DataFrame:
     x = d.copy()
-    x["position_early"] = 0.0
-    x["position_mid"] = 0.0
-    x["position_late"] = 0.0
+    x["position_s2_early"] = 0.0
+    x["position_s2_mid"] = 0.0
+    x["position_s2_late"] = 0.0
 
-    # Early decay: shorter rolling window
-    x.loc[(x["mom_k"].rolling(early_window).mean() > 0) & (x["liquidity"] > x["liquidity"].rolling(early_window).median()), "position_early"] = 1.0
-    x.loc[x["pred_crash_prob"] > T2, "position_early"] *= reduce_factor
+    # Early entry: smaller rolling window
+    early_mom = x["price"] / x["price"].shift(int(early_window)) - 1.0
+    cond_early = (early_mom > 0) & (x["pred_crash_prob"] < T2) & (x["liquidity"] > liq_median)
+    x.loc[cond_early, "position_s2_early"] = 1.0
 
-    # Mid decay: medium rolling window
-    x.loc[(x["mom_k"].rolling(mid_window).mean() > 0) & (x["liquidity"] > x["liquidity"].rolling(mid_window).median()), "position_mid"] = 1.0
-    x.loc[x["pred_crash_prob"] > T2, "position_mid"] *= reduce_factor
+    # Mid entry: medium rolling window
+    mid_mom = x["price"] / x["price"].shift(int(mid_window)) - 1.0
+    cond_mid = (mid_mom > 0) & (x["pred_crash_prob"] < T2) & (x["liquidity"] > liq_median)
+    x.loc[cond_mid, "position_s2_mid"] = 1.0
 
-    # Late decay: longer rolling window
-    x.loc[(x["mom_k"].rolling(late_window).mean() > 0) & (x["liquidity"] > x["liquidity"].rolling(late_window).median()), "position_late"] = 1.0
-    x.loc[x["pred_crash_prob"] > T2, "position_late"] *= reduce_factor
+    # Late entry: larger rolling window
+    late_mom = x["price"] / x["price"].shift(int(late_window)) - 1.0
+    cond_late = (late_mom > 0) & (x["pred_crash_prob"] < T2) & (x["liquidity"] > liq_median)
+    x.loc[cond_late, "position_s2_late"] = 1.0
+
+    # Reduce positions if crash probability is high
+    x.loc[x["pred_crash_prob"] > T2, ["position_s2_early","position_s2_mid","position_s2_late"]] *= reduce_factor
 
     return x
 
-# ---------------------------
-# Simulate rolling crash probabilities
-# ---------------------------
-
-st.subheader("Rolling crash probabilities (Monte Carlo)")
-
-progress = st.progress(0, text="Running Monte Carlo simulation...")
-crash_probs = []
-
-for i in range(len(df_bt) - int(H)):
-    P0, L0, I0 = df_bt["price"].iloc[i], df_bt["liquidity"].iloc[i], df_bt["imbalance"].iloc[i]
-    crash_count = 0
-    for _ in range(int(N_MC)):
-        sim = run_hybrid_simulation(P0, L0, I0, int(H), [alpha_L, beta_L, rho_I, mu_I, sigma0, kappa, gamma])
-        crash_price = sim[:,0] <= P0 * (1 - crash_pct)
-        crash_liq = (sim[:,1] <= L_min_ratio * L0) & (sim[:,2] <= -I_crit)
-        if persist_days <= len(crash_liq):
-            crash_liq_persist = np.convolve(crash_liq.astype(int), np.ones(int(persist_days), dtype=int), "valid") >= persist_days
-        else:
-            crash_liq_persist = np.array([False])
-        if np.any(crash_price) or np.any(crash_liq_persist):
-            crash_count += 1
-    crash_probs.append(crash_count / float(N_MC))
-    progress.progress((i + 1) / (len(df_bt) - int(H)), text=f"Running... {i+1}/{len(df_bt) - int(H)}")
-
-df_bt = df_bt.iloc[:len(crash_probs)].copy()
-df_bt["pred_crash_prob"] = crash_probs
-st.line_chart(df_bt.set_index("date")[["pred_crash_prob"]], use_container_width=True)
+strategy2_bt = build_strategy2_positions(df_long)
 
 # ---------------------------
-# Build Strategy 2 decay positions
-# ---------------------------
-
-positions_bt = build_decay_positions(df_bt)
-
-# ---------------------------
-# PnL computation
+# PnL computation for Strategy 2
 # ---------------------------
 
 def compute_strategy2_pnl(d: pd.DataFrame, fee_bps: float = 5.0):
-    x = d.copy()
-    x["ret"] = x["ret"].fillna(0.0)
-
-    for col in ["position_early", "position_mid", "position_late"]:
-        pos = x[col].fillna(0.0).values
+    df = d.copy()
+    df["ret"] = df["ret"].fillna(0.0)
+    for col in ["position_s2_early","position_s2_mid","position_s2_late"]:
+        pos = df[col].fillna(0.0).values
         pos_shift = np.roll(pos, 1); pos_shift[0] = 0.0
         turnover = np.abs(pos - pos_shift)
         tc = turnover * (fee_bps / 1e4)
-        x[f"{col}_pnl"] = pos * x["ret"] - tc
+        df[f"{col}_pnl"] = pos * df["ret"] - tc
+    df["bh_pnl"] = df["ret"]
+    eq = df.set_index("date")[[c+"_pnl" for c in ["position_s2_early","position_s2_mid","position_s2_late"]]+["bh_pnl"]].cumsum().apply(np.exp)
+    return df, eq
 
-    # Buy-and-hold benchmark
-    x["bh_pnl"] = x["ret"]
+bt_row, equity_curves = compute_strategy2_pnl(strategy2_bt)
 
-    eq = x.set_index("date")[[f"{col}_pnl" for col in ["position_early", "position_mid", "position_late"]] + ["bh_pnl"]].cumsum().apply(np.exp)
-    return x, eq
-
-bt_row, equity_curves = compute_strategy2_pnl(positions_bt)
-
-st.subheader("Equity curves (normalized)")
+st.subheader("Equity curves (Strategy 2)")
 st.line_chart(equity_curves, use_container_width=True)
 
 # ---------------------------
-# Performance summary
+# Decision log for Strategy 2
 # ---------------------------
 
-def summarize_strategy2(d: pd.DataFrame, eq: pd.DataFrame):
+def build_decision_log_strategy2(d: pd.DataFrame) -> pd.DataFrame:
+    log = d[["date","price","liquidity","imbalance","ret","pred_crash_prob"]].copy()
+    log["position_s2_early"] = d["position_s2_early"]
+    log["position_s2_mid"] = d["position_s2_mid"]
+    log["position_s2_late"] = d["position_s2_late"]
+    fwd = d["price"].shift(-int(H)) / d["price"] - 1.0
+    log[f"fwd_return_{int(H)}d"] = fwd
+    log[f"fwd_crash_{int(H)}d"] = (fwd <= -crash_pct).astype(int)
+    return log
+
+decision_log = build_decision_log_strategy2(strategy2_bt)
+with st.expander("Decision log (exportable)"):
+    st.dataframe(decision_log.tail(20), use_container_width=True)
+    st.download_button("Download decision log CSV", data=decision_log.to_csv(index=False), file_name="decision_log.csv", mime="text/csv")
+
+# ---------------------------
+# Performance summary for Strategy 2
+# ---------------------------
+
+def summarize_strategy2_performance(d: pd.DataFrame, eq: pd.DataFrame) -> pd.DataFrame:
     ann_factor = 365
-    cols = [c for c in eq.columns if "_pnl" in c]
+    pnl_cols = [c for c in eq.columns]
     rows = []
-    for col in cols:
-        r = d[col].fillna(0.0)
+    for col in pnl_cols:
+        r = d[col.replace("_pnl","")+"_pnl"].fillna(0.0)
         cum = np.exp(r.cumsum().iloc[-1]) - 1.0
         vol = r.std() * np.sqrt(ann_factor)
         sharpe = (r.mean() * ann_factor) / (vol + 1e-12)
         curve = eq[col]
         mdd = (curve.cummax() / curve - 1.0).max()
-        rows.append({"strategy": col.replace("_pnl", ""), "cum_return": cum, "ann_vol": vol, "sharpe": sharpe, "max_drawdown": mdd})
+        rows.append({
+            "strategy": col.replace("_pnl",""),
+            "cum_return": cum,
+            "ann_vol": vol,
+            "sharpe": sharpe,
+            "max_drawdown": mdd
+        })
     return pd.DataFrame(rows)
 
-perf = summarize_strategy2(bt_row, equity_curves)
-st.subheader("Performance summary")
-st.dataframe(perf.style.format({"cum_return": "{:.1%}", "ann_vol": "{:.2f}", "sharpe": "{:.2f}", "max_drawdown": "{:.1%}"}), use_container_width=True)
+perf = summarize_strategy2_performance(bt_row, equity_curves)
+st.subheader("Performance summary (Strategy 2)")
+st.dataframe(
+    perf.style.format({"cum_return": "{:.1%}", "ann_vol": "{:.2f}", "sharpe": "{:.2f}", "max_drawdown": "{:.1%}"}),
+    use_container_width=True
+    )
