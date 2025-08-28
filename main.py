@@ -1,5 +1,5 @@
 # ---------------------------
-# Chunk 1: Data Loading, Derivation, ECDS, Monte Carlo
+# Chunk 1: Imports, Config, Data Helpers, Simulation
 # ---------------------------
 
 import streamlit as st
@@ -10,22 +10,27 @@ from typing import Dict
 from scipy.stats import norm
 
 # ---------------------------
-# CoinGecko Pro key (hard-coded)
+# CoinGecko API (hard-coded)
 # ---------------------------
 COINGECKO_API_KEY = "CG-chRgqiH9ab4zsFTm2Zvst82a"
 HEADERS: Dict[str, str] = {"x-cg-pro-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
-st.set_page_config(page_title="Low-Cap Crypto Strategy 2 Backtest", layout="wide")
-st.title("Low-Cap Crypto Crash Simulator & Strategy 2 Backtest")
+st.set_page_config(page_title="Low-Cap Crypto Crash Backtest", layout="wide")
+st.title("Low-Cap Crypto Sector Crash Simulator & Backtest (Strategy 2 only)")
 
 st.markdown("""
-This dashboard backtests **Strategy 2 only** (momentum + liquidity) with early/mid/late entry timing
-and overlays Monte Carlo crash probability. Data is fetched from CoinGecko.
+This dashboard simulates low-cap crypto crash risk using liquidity and imbalance dynamics, and backtests:
+
+- **Strategy 2 only**: momentum + liquidity risk filter.
+- **Early/Mid/Late timed entries** based on rolling windows.
+- **Early decay simulation**.
+
+Data: CoinGecko API (Pro header included). Research tool only; not financial advice.
 """)
 
 # ---------------------------
-# Data helpers
+# Data fetching
 # ---------------------------
 @st.cache_data(show_spinner=False, ttl=60*30)
 def cg_coin_market_chart(coin_id: str, vs_currency: str, days: int):
@@ -34,10 +39,12 @@ def cg_coin_market_chart(coin_id: str, vs_currency: str, days: int):
     r = requests.get(url, params=params, headers=HEADERS, timeout=30)
     r.raise_for_status()
     data = r.json()
+
     def to_df(lst, col):
         df = pd.DataFrame(lst, columns=["ts_ms", col])
         df["date"] = pd.to_datetime(df["ts_ms"], unit="ms").dt.tz_localize(None)
         return df[["date", col]]
+
     prices = to_df(data.get("prices", []), "price")
     volumes = to_df(data.get("total_volumes", []), "volume")
     mktcap = to_df(data.get("market_caps", []), "market_cap")
@@ -45,12 +52,17 @@ def cg_coin_market_chart(coin_id: str, vs_currency: str, days: int):
     df.sort_values("date", inplace=True)
     return df
 
+# ---------------------------
+# Liquidity & Imbalance
+# ---------------------------
 def derive_liquidity_and_imbalance(df: pd.DataFrame, vol_window: int = 14, flow_window: int = 7) -> pd.DataFrame:
     out = df.copy()
     out["ret"] = np.log(out["price"]).diff()
     out["volatility"] = out["ret"].rolling(vol_window).std()
     out["norm_volume"] = out["volume"].rolling(vol_window).mean()
+    # Liquidity proxy: higher when volume is higher and volatility is lower
     out["liquidity"] = (out["norm_volume"] / (out["volatility"] + 1e-8)).fillna(method="bfill").fillna(0)
+    # Imbalance proxy: recent signed drift
     out["imbalance"] = (out["ret"].rolling(flow_window).mean() - out["ret"].rolling(flow_window).median()).fillna(0)
     return out[["date","price","liquidity","imbalance","ret","volume","market_cap"]]
 
@@ -59,8 +71,8 @@ def derive_liquidity_and_imbalance(df: pd.DataFrame, vol_window: int = 14, flow_
 # ---------------------------
 st.sidebar.header("Data")
 source = st.sidebar.selectbox("Source", ["CoinGecko (auto)", "Upload CSV"])
-uploaded_df = None
 
+uploaded_df = None
 if source == "Upload CSV":
     uploaded = st.sidebar.file_uploader("CSV with columns: date, price, liquidity, imbalance", type="csv")
     if uploaded:
@@ -88,9 +100,7 @@ else:
         st.dataframe(df.tail(10), use_container_width=True)
 
 if df is None or len(df) < 60:
-    st.stop()# ---------------------------
-# Chunk 2: Strategy 2, Monte Carlo, Early/Mid/Late entries, PnL, Visualization
-# ---------------------------
+    st.stop()
 
 # ---------------------------
 # Simulation parameters
@@ -105,91 +115,141 @@ mu_I = st.sidebar.number_input("mu_I", value=-0.02, step=0.01, format="%.2f")
 sigma0 = st.sidebar.number_input("sigma0", value=0.03, step=0.005, format="%.3f")
 kappa = st.sidebar.number_input("kappa", value=0.5, step=0.05, format="%.2f")
 gamma = st.sidebar.number_input("gamma", value=0.5, step=0.05, format="%.2f")
-crash_pct = st.sidebar.number_input("Crash % threshold", value=0.25, min_value=0.05, max_value=0.9, step=0.05)
+crash_pct = st.sidebar.number_input("Crash % threshold", value=0.25, min_value=0.05, max_value=0.9, step=0.05, format="%.2f")
 L_min_ratio = st.sidebar.number_input("Liquidity min ratio", value=0.10, min_value=0.01, max_value=1.0, step=0.01, format="%.2f")
 I_crit = st.sidebar.number_input("Imbalance threshold", value=0.20, min_value=0.01, max_value=2.0, step=0.01, format="%.2f")
 persist_days = st.sidebar.number_input("Persistence days (liquidity crash)", value=3, min_value=1, max_value=30)
 
 # ---------------------------
-# Monte Carlo hybrid simulation
+# Hybrid Monte Carlo simulation
 # ---------------------------
 def run_hybrid_simulation(P0, L0, I0, H, params):
     alpha_L, beta_L, rho_I, mu_I, sigma0, kappa, gamma = params
-    P, L, I = P0, max(1e-6,L0), np.clip(I0,-1,1)
+    P = P0
+    L = max(1e-6, L0)
+    I = np.clip(I0, -1, 1)
     path = []
     for _ in range(int(H)):
         delta_flow = 0.0
         r_prev = 0.0
-        L_prop = L * (1 + alpha_L*delta_flow - beta_L*(abs(r_prev)>0.05))
+        L_prop = L * (1 + alpha_L * delta_flow - beta_L * (abs(r_prev) > 0.05))
         shock = 0.0
-        I_prop = rho_I*I + shock + np.random.randn()*0.01
-        gL = 1 + kappa*(1.0/(L_prop+1e-6))**gamma
-        r = mu_I*I_prop + sigma0*gL*np.random.randn()
+        I_prop = rho_I * I + shock + np.random.randn() * 0.01
+        gL = 1 + kappa * (1.0 / (L_prop + 1e-6)) ** gamma
+        r = mu_I * I_prop + sigma0 * gL * np.random.randn()
         P *= np.exp(r)
-        L = max(1e-6,L_prop)
-        I = np.clip(I_prop,-1,1)
-        path.append([P,L,I,r])
+        L = max(1e-6, L_prop)
+        I = np.clip(I_prop, -1, 1)
+        path.append([P, L, I, r])
     return np.array(path)
 
 # ---------------------------
-# Compute rolling crash probabilities
+# Chunk 2: Strategy 2, Timed Entries, Early Decay, PnL
 # ---------------------------
-with st.expander("Rolling crash probabilities"):
-    progress = st.progress(0, text="Running Monte Carlo backtest...")
-    crash_probs = []
-    idxs = list(range(0, len(df)-int(H)))
-    for i, idx in enumerate(idxs):
-        P0, L0, I0 = df["price"].iloc[idx], df["liquidity"].iloc[idx], df["imbalance"].iloc[idx]
-        crash_count = 0
-        for _ in range(int(N_MC)):
-            sim = run_hybrid_simulation(P0,L0,I0,int(H),[alpha_L,beta_L,rho_I,mu_I,sigma0,kappa,gamma])
-            crash_price = sim[:,0] <= P0*(1-crash_pct)
-            crash_liq = (sim[:,1]<=L_min_ratio*L0) & (sim[:,2]<=-I_crit)
-            if persist_days <= len(crash_liq):
-                crash_liq_persist = np.convolve(crash_liq.astype(int), np.ones(int(persist_days)), "valid") >= persist_days
-            else:
-                crash_liq_persist = np.array([False])
-            if np.any(crash_price) or np.any(crash_liq_persist):
-                crash_count += 1
-        crash_probs.append(crash_count/float(N_MC))
-        progress.progress((i+1)/len(idxs), text=f"Running... {i+1}/{len(idxs)}")
-
-df_bt = df.iloc[:len(crash_probs)].copy()
-df_bt["pred_crash_prob"] = crash_probs
-st.line_chart(df_bt.set_index("date")[["pred_crash_prob"]], use_container_width=True)
 
 # ---------------------------
-# Strategy 2 only: momentum + liquidity
+# Long Strategy 2: Momentum + Liquidity Filter
 # ---------------------------
-st.subheader("Strategy 2: Momentum + Liquidity (Early/Mid/Late entry)")
-with st.sidebar.expander("Strategy 2 parameters"):
-    k_mom = st.number_input("Momentum lookback", value=20, min_value=5, max_value=120, step=5)
+st.subheader("Strategy 2 (only)")
+
+with st.sidebar.expander("Strategy 2 parameters", expanded=True):
+    k_mom = st.number_input("Momentum lookback (days)", value=20, min_value=5, max_value=120, step=5)
     T2 = st.number_input("Crash prob soft threshold", value=0.25, min_value=0.0, max_value=1.0, step=0.05)
-    reduce_factor = st.number_input("Size reduce factor", value=0.5, min_value=0.0, max_value=1.0, step=0.1)
-    entry_window_days = st.number_input("Entry rolling window (days)", value=10, min_value=2, max_value=30, step=1)
+    reduce_factor = st.number_input("Size reduce factor when risk rises", value=0.5, min_value=0.0, max_value=1.0, step=0.1)
+    entry_window_days = st.number_input("Entry timing window (days) for early/mid/late", value=5, min_value=1, max_value=30, step=1)
+    decay_factor = st.number_input("Early decay factor", value=0.7, min_value=0.0, max_value=1.0, step=0.05)
 
-df_bt["mom_k"] = df_bt["price"]/df_bt["price"].shift(int(k_mom)) - 1.0
-liq_med = df_bt["liquidity"].median()
+df_long = df.copy()
+df_long["mom_k"] = df_long["price"] / df_long["price"].shift(int(k_mom)) - 1.0
+liq_median = df_long["liquidity"].median()
 
-# Early/Mid/Late entry: rolling windows
-def assign_entry_timing(d: pd.DataFrame, window: int):
-    early, mid, late = np.zeros(len(d)), np.zeros(len(d)), np.zeros(len(d))
-    for i in range(len(d)):
-        start = max(0,i-window+1)
-        mom_window = d["mom_k"].iloc[start:i+1]
-        liq_window = d["liquidity"].iloc[start:i+1]
-        prob_window = d["pred_crash_prob"].iloc[start:i+1]
+# Generate entry signals: early/mid/late based on rolling window
+def timed_entries(df, window, decay):
+    df = df.copy()
+    df["position_early"] = 0.0
+    df["position_mid"] = 0.0
+    df["position_late"] = 0.0
+    for i in range(len(df)):
+        start = max(0, i - window + 1)
+        window_slice = df.iloc[start:i+1]
+        # Early: first day in window, apply decay
+        if window_slice.shape[0] >= 1 and (window_slice["mom_k"].iloc[-1] > 0) and (window_slice["liquidity"].iloc[-1] > liq_median):
+            df.loc[df.index[i], "position_early"] = decay
+        # Mid: middle day
+        if window_slice.shape[0] >= 3 and (window_slice["mom_k"].iloc[-1] > 0) and (window_slice["liquidity"].iloc[-1] > liq_median):
+            df.loc[df.index[i], "position_mid"] = 1.0
+        # Late: last day
+        if window_slice.shape[0] >= window and (window_slice["mom_k"].iloc[-1] > 0) and (window_slice["liquidity"].iloc[-1] > liq_median):
+            df.loc[df.index[i], "position_late"] = 1.0
+    return df
 
-        # Early entry: first signal in window
-        if ((mom_window>0) & (liq_window>liq_med) & (prob_window<T2)).any():
-            early[i] = 1.0
-        # Mid entry: median signal
-        if ((mom_window>0) & (liq_window>liq_med) & (prob_window<T2)).sum() >= window//2:
-            mid[i] = 1.0
-        # Late entry: persistent window signal
-        if ((mom_window>0) & (liq_window>liq_med) & (prob_window<T2)).sum() == window:
-            late[i] = 1.0
-    return early, mid, late
+strategy_bt = timed_entries(df_long, int(entry_window_days), decay_factor)
 
-df_bt["entry_early"], df_bt["entry_mid"], df_bt["entry_late"] = assign_entry_timing(df_bt,int(entry_window_days))
-st.dataframe(df_bt[["date","mom_k","liquidity","pred_crash_prob","entry_early","entry_mid","entry_late"]].tail(20))
+# ---------------------------
+# PnL Computation
+# ---------------------------
+def compute_pnl_strategy(df, fee_bps=5.0):
+    d = df.copy()
+    d["ret"] = d["ret"].fillna(0.0)
+    pnl_cols = ["position_early", "position_mid", "position_late"]
+    eq_curves = pd.DataFrame(index=d["date"])
+    for col in pnl_cols:
+        pos = d[col].fillna(0.0).values
+        pos_shift = np.roll(pos, 1); pos_shift[0] = 0.0
+        turnover = np.abs(pos - pos_shift)
+        tc = turnover * (fee_bps / 1e4)
+        d[f"{col}_pnl"] = pos * d["ret"] - tc
+        eq_curves[col] = np.exp(d[f"{col}_pnl"].cumsum())
+    # Benchmark: buy-and-hold
+    eq_curves["bh"] = np.exp(d["ret"].cumsum())
+    return d, eq_curves
+
+bt_row, equity_curves = compute_pnl_strategy(strategy_bt)
+
+# ---------------------------
+# Plot Equity Curves
+# ---------------------------
+st.subheader("Equity curves (Strategy 2 only)")
+st.line_chart(equity_curves, use_container_width=True)
+
+# ---------------------------
+# Decision Log
+# ---------------------------
+def build_decision_log(df):
+    log = df[["date","price","liquidity","imbalance","ret","mom_k",
+              "position_early","position_mid","position_late"]].copy()
+    return log
+
+decision_log = build_decision_log(strategy_bt)
+with st.expander("Decision log (exportable)"):
+    st.dataframe(decision_log.tail(20), use_container_width=True)
+    st.download_button("Download decision log CSV", data=decision_log.to_csv(index=False), file_name="decision_log_strategy2.csv", mime="text/csv")
+
+# ---------------------------
+# Performance Summary
+# ---------------------------
+def summarize_performance(df, eq):
+    ann_factor = 365
+    rows = []
+    for col in eq.columns:
+        r = df[col.replace("_pnl","") + "_pnl"].fillna(0.0) if col != "bh" else df["ret"]
+        cum = np.exp(r.cumsum().iloc[-1]) - 1.0
+        vol = r.std() * np.sqrt(ann_factor)
+        sharpe = (r.mean() * ann_factor) / (vol + 1e-12)
+        curve = eq[col]
+        mdd = (curve.cummax() / curve - 1.0).max()
+        rows.append({
+            "strategy": col,
+            "cum_return": cum,
+            "ann_vol": vol,
+            "sharpe": sharpe,
+            "max_drawdown": mdd
+        })
+    return pd.DataFrame(rows)
+
+perf = summarize_performance(bt_row, equity_curves)
+st.subheader("Performance summary (Strategy 2 only)")
+st.dataframe(
+    perf.style.format({"cum_return": "{:.1%}", "ann_vol": "{:.2f}", "sharpe": "{:.2f}", "max_drawdown": "{:.1%}"}),
+    use_container_width=True
+)
